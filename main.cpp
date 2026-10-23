@@ -5,6 +5,7 @@
 #include <string>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <chrono>
 
 #include <cstdint>
 #include <cstring>
@@ -51,7 +52,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 	std::vector<PlayerState> players;
 
+	// 送信できなかったデータを保存するバッファ
+	std::vector<char> sendBuffer;
+
+	// まだ処理できていない受信データを保存するバッファ
+	std::vector<char> receiveBuffer;
+
 	int gameLoopCount = 0;
+
+	int fps = 0;
+	int frameCount = 0;
+
+	auto lastTime = std::chrono::steady_clock::now();
 
 	// サーバーから割り当てられる自分のID
 	uint16_t playerId = 0;
@@ -62,6 +74,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		Novice::GetHitKeyStateAll(keys);
 
 		gameLoopCount++;
+
+		
+frameCount++;
+
+		// 現在時刻を取得
+		auto currentTime = std::chrono::steady_clock::now();
+
+		// 前回計測から何秒経過したか
+		double elapsed = std::chrono::duration<double>(currentTime - lastTime).count();
+
+		// 1秒経過したらFPSを更新
+		if (elapsed >= 1.0) {
+
+			fps = static_cast<int>(frameCount / elapsed);
+
+			frameCount = 0;
+			lastTime = currentTime;
+		}
+
 
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
@@ -85,6 +116,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 				// OS同氏が3回やり取りして接続する
 				connected = connect(clientSocket, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0;
 
+				if (connected) {
+
+					// ノンブロッキングモードを有効にする
+					u_long mode = 1;
+
+					connected = ioctlsocket(clientSocket, FIONBIO, &mode) == 0;
+				}
+
 				// 終わったら情報を返し、失敗をしたら閉じる
 				freeaddrinfo(address);
 				if (!connected) {
@@ -95,36 +134,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 				if (connected) {
 
-					// 本文の長さは0バイト
+					// JoinRequestの本文長は0
 					uint16_t payloadSize = 0;
 
-					// 送信するメッセージの種類
+					// 参加要求のメッセージ種別
 					MessageType type = MessageType::JoinRequest;
 
-					// 送信用の4バイト配列
+					// ヘッダー4バイト
 					char sendFrame[4]{};
 
-					// 先頭2バイトに本文長を格納
 					std::memcpy(sendFrame, &payloadSize, 2);
-
-					// 次の2バイトにメッセージ種別を格納
 					std::memcpy(sendFrame + 2, &type, 2);
 
-					// 4バイトすべてを送信する
-					int sendBytes = 0;
-
-					while (connected && sendBytes < 4) {
-
-						int n = send(clientSocket, sendFrame + sendBytes, 4 - sendBytes, 0);
-
-						if (n <= 0) {
-
-							connected = false;
-							break;
-						}
-
-						sendBytes += n;
-					}
+					// 送信バッファの末尾に4バイト追加
+					sendBuffer.insert(sendBuffer.end(), sendFrame, sendFrame + 4);
 				}
 			}
 		}
@@ -135,11 +158,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		ImGui::InputText("Text", text, sizeof(text));
 
 		if (connected) {
-
-			// ヘッダー4バイト本文1024バイト
-			char receiveFrame[1028]{};
-
-			int receivedBytes = 0;
 
 			// 接続中ならキー入力を取得
 			if (connected) {
@@ -185,150 +203,148 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 				// WASDの入力情報
 				std::memcpy(sendFrame + 4, &inputBits, 2);
 
-				
-    // 送信するデータの合計サイズ
-				int frameSize = 6;
-
-				int sentBytes = 0;
-
-				// 全部送るまで繰り返す
-				while (connected && sentBytes < frameSize) {
-
-					int n = send(clientSocket, sendFrame + sentBytes, frameSize - sentBytes, 0);
-
-					// 送信失敗
-					if (n <= 0) {
-						connected = false;
-						break;
-					}
-
-					sentBytes += n;
-				}
-
-				// 送信バイト数を表示
-				sentBytesDisplay = sentBytes;
-
-
+				// 送信待ちの末尾へ追加
+				sendBuffer.insert(sendBuffer.end(), sendFrame, sendFrame + 6);
 			}
 
-			// ヘッダー4バイトを受信
-			while (connected && receivedBytes < 4) {
+			// 送信待ちのデータがある場合
+			if (connected && !sendBuffer.empty()) {
 
-				int n = recv(clientSocket, receiveFrame + receivedBytes, 4 - receivedBytes, 0);
+				// 送信を1回だけ試す
+				int n = send(clientSocket, sendBuffer.data(), static_cast<int>(sendBuffer.size()), 0);
 
-				if (n <= 0) {
+				if (n > 0) {
+
+					// 送れたバイト数だけ先頭から削除
+					sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + n);
+
+					sentBytesDisplay = n;
+				} else if (n == 0) {
+
+					connected = false;
+				} else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+
+					connected = false;
+				}
+			}
+
+			// 受信を1回だけ試す
+			if (connected) {
+
+				char chunk[2048]{};
+
+				int n = recv(clientSocket, chunk, sizeof(chunk), 0);
+
+				if (n > 0) {
+
+					// 受信したデータを末尾に追加
+					receiveBuffer.insert(receiveBuffer.end(), chunk, chunk + n);
+
+					receivedBytesDisplay = n;
+				} else if (n == 0) {
+
+					// サーバーが切断した
+					connected = false;
+				} else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+
+					// 通信エラー
+					connected = false;
+				}
+			}
+
+			// 完成したフレームを順番に処理
+			while (connected && receiveBuffer.size() >= 4) {
+
+				// ヘッダーを読み取る
+				uint16_t payloadSize = 0;
+				MessageType type{};
+
+				std::memcpy(&payloadSize, receiveBuffer.data(), 2);
+				std::memcpy(&type, receiveBuffer.data() + 2, 2);
+
+				// 本文が大きすぎる場合は切断
+				if (payloadSize > 1024) {
+					connected = false;
+					break;
+				}
+
+				// ヘッダー4バイト + 本文長
+				int frameSize = 4 + payloadSize;
+
+				// まだ全部届いていなければ次のループまで残す
+				if (static_cast<int>(receiveBuffer.size()) < frameSize) {
+					break;
+				}
+
+				// 本文の先頭
+				const char* payload = receiveBuffer.data() + 4;
+
+				// 自分のIDを受け取る
+				if (type == MessageType::AssignPlayerId && payloadSize == 2) {
+
+					std::memcpy(&playerId, payload, 2);
+				}
+
+				// サーバーから切断通知
+				if (type == MessageType::Disconnect) {
 
 					connected = false;
 					break;
 				}
 
-				receivedBytes += n;
-			}
+				// プレイヤー全員の位置を受信
+				if (type == MessageType::WorldState && payloadSize >= 2) {
 
-			// ヘッダーを読み取る
-			if (connected) {
+					uint16_t count = 0;
+					std::memcpy(&count, payload, 2);
 
-				uint16_t payloadSize = 0;
-				MessageType type{};
+					// 人数とデータサイズを確認
+					if (count <= 128 && payloadSize == 2 + count * 6) {
 
-				std::memcpy(&payloadSize, receiveFrame, 2);
-				std::memcpy(&type, receiveFrame + 2, 2);
+						players.resize(count);
 
-				// 本文が大きすぎる場合は切断
-				if (payloadSize > 1024) {
+						for (int i = 0; i < count; ++i) {
 
-					connected = false;
-				}
-
-				// 本文を受信する
-				int bodyReceived = 0;
-
-				while (connected && bodyReceived < payloadSize) {
-
-					int n = recv(clientSocket, receiveFrame + 4 + bodyReceived, payloadSize - bodyReceived, 0);
-
-					if (n <= 0) {
-
-						connected = false;
-						break;
-					}
-
-					bodyReceived += n;
-				}
-
-				// メッセージの種類を確認
-				if (connected) {
-
-					const char* payload = receiveFrame + 4;
-
-					if (type == MessageType::AssignPlayerId && payloadSize == 2) {
-
-						// サーバーから受け取った自分のIDを保存
-						std::memcpy(&playerId, payload, 2);
-					}
-
-					if (type == MessageType::Disconnect) {
-
-						connected = false;
-					}
-
-					if (type == MessageType::WorldState && payloadSize >= 2) {
-
-						// 参加人数を取り出す
-						uint16_t count = 0;
-						std::memcpy(&count, payload, 2);
-
-						// 人数とデータサイズが正しいか確認
-						if (count <= 128 && payloadSize == 2 + count * 6) {
-
-							// 人数分の保存領域を用意
-							players.resize(count);
-
-							// 一人ずつ情報を取り出す
-							for (int i = 0; i < count; ++i) {
-
-								// プレイヤーID
-								std::memcpy(&players[i].id, payload + 2 + i * 6, 2);
-
-								// X座標
-								std::memcpy(&players[i].x, payload + 4 + i * 6, 2);
-
-								// Y座標
-								std::memcpy(&players[i].y, payload + 6 + i * 6, 2);
-							}
+							std::memcpy(&players[i].id, payload + 2 + i * 6, 2);
+							std::memcpy(&players[i].x, payload + 4 + i * 6, 2);
+							std::memcpy(&players[i].y, payload + 6 + i * 6, 2);
 						}
 					}
-
-					receivedBytesDisplay = 4 + bodyReceived;
 				}
+
+				// 処理したフレームを先頭から削除
+				receiveBuffer.erase(receiveBuffer.begin(), receiveBuffer.begin() + frameSize);
 			}
 		}
 
 		if (!connected && clientSocket != INVALID_SOCKET) {
 
-			// ソケットを閉じる
 			closesocket(clientSocket);
-
-			// 無効なソケットに戻す
 			clientSocket = INVALID_SOCKET;
 
-			// プレイヤーの一覧を空にする
+			// 送受信バッファを空にする
+			sendBuffer.clear();
+			receiveBuffer.clear();
+
+			// プレイヤー情報を初期化
 			players.clear();
+			playerId = 0;
 		}
 
 		if (ImGui::Button("Disconnect")) {
 
-			// 未接続状態に変更
 			connected = false;
 
-			// ソケットを閉じる
 			if (clientSocket != INVALID_SOCKET) {
 				closesocket(clientSocket);
 				clientSocket = INVALID_SOCKET;
 			}
 
-			// プレイヤー一覧を削除
+			// バッファとプレイヤー情報を初期化
+			sendBuffer.clear();
+			receiveBuffer.clear();
 			players.clear();
+			playerId = 0;
 		}
 
 		ImGui::Text("Sent: %d bytes", sentBytesDisplay);
@@ -339,7 +355,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		ImGui::Text("Status: %s", connected ? "Connected" : "Not connected");
 		ImGui::Text("My Player ID: %u", static_cast<unsigned int>(playerId));
 		ImGui::Text("Game loop: %d", gameLoopCount);
-
+		ImGui::Text("FPS: %d", fps);
 		ImGui::End();
 #endif
 

@@ -19,6 +19,7 @@ enum class MessageType : uint16_t {
 	JoinRequest = 3,    // クライアントー＞サーバ
 	WorldState = 4,     // サーバー＞全参加者
 	Disconnect = 5,
+	PlayerInput = 6,
 
 };
 
@@ -31,6 +32,9 @@ struct PlayerState {
 // Windowsアプリのmain関数。ImGuiを使うため、Debugで実行する。
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	Novice::Initialize("NT1_01_03", 1280, 720);
+	// キーボードの入力状態を保存
+	char keys[256]{};
+
 	char host[64] = "34.104.202.113";
 	char port[8] = "8000";
 	bool connected = false;
@@ -49,10 +53,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 	int gameLoopCount = 0;
 
+	// サーバーから割り当てられる自分のID
+	uint16_t playerId = 0;
+
 	while (Novice::ProcessMessage() == 0) {
 		Novice::BeginFrame();
-		gameLoopCount++;
+		// 現在のキーボード入力を取得
+		Novice::GetHitKeyStateAll(keys);
 
+		gameLoopCount++;
 
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
@@ -132,6 +141,76 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 			int receivedBytes = 0;
 
+			// 接続中ならキー入力を取得
+			if (connected) {
+
+				// 毎ループ0から作成する
+				uint16_t inputBits = 0;
+
+				// Wキー：上
+				if (keys[DIK_W]) {
+					inputBits |= 0x0001;
+				}
+
+				// Sキー：下
+				if (keys[DIK_S]) {
+					inputBits |= 0x0002;
+				}
+
+				// Aキー：左
+				if (keys[DIK_A]) {
+					inputBits |= 0x0004;
+				}
+
+				// Dキー：右
+				if (keys[DIK_D]) {
+					inputBits |= 0x0008;
+				}
+
+				// 本文は入力ビットの2バイト
+				uint16_t payloadSize = 2;
+
+				// メッセージの種類
+				MessageType type = MessageType::PlayerInput;
+
+				// ヘッダー4バイト + 本文2バイト
+				char sendFrame[6]{};
+
+				// 本文長
+				std::memcpy(sendFrame, &payloadSize, 2);
+
+				// メッセージ種別
+				std::memcpy(sendFrame + 2, &type, 2);
+
+				// WASDの入力情報
+				std::memcpy(sendFrame + 4, &inputBits, 2);
+
+				
+    // 送信するデータの合計サイズ
+				int frameSize = 6;
+
+				int sentBytes = 0;
+
+				// 全部送るまで繰り返す
+				while (connected && sentBytes < frameSize) {
+
+					int n = send(clientSocket, sendFrame + sentBytes, frameSize - sentBytes, 0);
+
+					// 送信失敗
+					if (n <= 0) {
+						connected = false;
+						break;
+					}
+
+					sentBytes += n;
+				}
+
+				// 送信バイト数を表示
+				sentBytesDisplay = sentBytes;
+
+
+			}
+
 			// ヘッダー4バイトを受信
 			while (connected && receivedBytes < 4) {
 
@@ -181,6 +260,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 				if (connected) {
 
 					const char* payload = receiveFrame + 4;
+
+					if (type == MessageType::AssignPlayerId && payloadSize == 2) {
+
+						// サーバーから受け取った自分のIDを保存
+						std::memcpy(&playerId, payload, 2);
+					}
 
 					if (type == MessageType::Disconnect) {
 
@@ -252,9 +337,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 		ImGui::EndDisabled();
 		ImGui::Text("Status: %s", connected ? "Connected" : "Not connected");
-		ImGui::Text("Players: %d", static_cast<int>(players.size()));
+		ImGui::Text("My Player ID: %u", static_cast<unsigned int>(playerId));
 		ImGui::Text("Game loop: %d", gameLoopCount);
-
 
 		ImGui::End();
 #endif
@@ -262,10 +346,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		// サーバーから受信した全プレイヤーを描画
 		for (const PlayerState& player : players) {
 
-			// 円の色
-			uint32_t color = 0x55BD79FF;
+			// 自分ならオレンジ、他の人なら緑
+			uint32_t color = player.id == playerId ? 0xFFAB40FF : 0x55BD79FF;
 
 			Novice::DrawEllipse(player.x, player.y, 16, 16, 0.0f, color, kFillModeSolid);
+
+			if (player.id == playerId) {
+
+				// ゲームループに合わせて輪の半径を変更
+				int ring = 20 + (gameLoopCount % 30);
+
+				// 自分の円の周りに輪を描く
+				Novice::DrawEllipse(player.x, player.y, ring, ring, 0.0f, 0xFFAB40FF, kFillModeWireFrame);
+			}
 		}
 
 		Novice::EndFrame();
